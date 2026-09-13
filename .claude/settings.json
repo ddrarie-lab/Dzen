@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/tools/continuity/sync.sh\" pull",
+            "timeout": 90,
+            "statusMessage": "Синхронизация состояния проекта…"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/tools/continuity/sync.sh\" push",
+            "timeout": 120,
+            "statusMessage": "Отправляю состояние в GitHub…"
+          }
+        ]
+      }
+    ]
+  }
+}
