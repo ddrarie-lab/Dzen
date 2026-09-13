@@ -17,12 +17,26 @@ set -uo pipefail
 
 MODE="${1:-full}"
 
-ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+# Репозиторий определяем по расположению САМОГО скрипта (<репозиторий>/tools/continuity/),
+# а не по текущей папке: таймер на сервере запускает скрипт по абсолютному пути,
+# оставаясь в чужой директории.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+CANDIDATE="$(cd "${SELF_DIR:-.}/../.." 2>/dev/null && pwd)"
+CANDIDATE="${CANDIDATE:-$PWD}"
+
+# Репозитории на сервере принадлежат разным пользователям (buzz, root, иногда
+# UID без записи в passwd). Без этого git отказывается работать с «dubious ownership».
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=safe.directory
+export GIT_CONFIG_VALUE_0="$CANDIDATE"
+
+ROOT="$(git -C "$CANDIDATE" rev-parse --show-toplevel 2>/dev/null)"
 if [ -z "$ROOT" ]; then
-  echo "continuity: не git-репозиторий, пропускаю"
+  echo "continuity: $CANDIDATE — не git-репозиторий, пропускаю"
   exit 0
 fi
 cd "$ROOT" || exit 0
+export GIT_CONFIG_VALUE_0="$ROOT"
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
 if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
@@ -145,6 +159,27 @@ do_scan() {
 
   echo "scan: чисто, можно синкать"
   return 0
+}
+
+# fetch с повторами по сети, но БЕЗ повторов, если ветки на origin просто нет
+# (иначе старт сессии зря ждёт полминуты).
+do_fetch() {
+  local out rc delay=2 i
+  for i in 1 2 3 4 5; do
+    out="$(git fetch --quiet origin "$BRANCH" 2>&1)"; rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    if printf '%s' "$out" | grep -qi "couldn't find remote ref\|not found in upstream"; then
+      echo "continuity: ветки origin/$BRANCH ещё нет — подтягивать нечего"
+      return 1
+    fi
+    printf '%s\n' "$out"
+    [ "$i" = 5 ] && break
+    echo "continuity: fetch origin/$BRANCH — попытка $i не удалась, жду ${delay}s"
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+  echo "continuity: fetch origin/$BRANCH — не получилось после 5 попыток"
+  return 1
 }
 
 do_pull() {
