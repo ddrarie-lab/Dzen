@@ -2,6 +2,7 @@
 # Непрерывность работы между точками входа: Claude в вебе, Claude CLI на ПК,
 # Claude на сервере (Termius / TG-бот). Общее состояние едет через GitHub.
 #
+#   sync.sh scan   — проверить файлы состояния на секреты, НИЧЕГО не отправляя
 #   sync.sh pull   — подтянуть чужие правки и показать, где мы остановились
 #   sync.sh push   — отправить файлы состояния (HANDOFF / память) в GitHub
 #   sync.sh full   — pull, затем push (для таймера на сервере)
@@ -63,31 +64,36 @@ retry() {   # retry <описание> <команда...> — 4 попытки 
 # --- защита от утечки секретов -------------------------------------------
 # Печатаем только файл, строку и имя правила. Само значение — никогда
 # (лог может уехать в git; см. .claude/rules/security.md в buzzmoda).
+
+# Общие правила. rule_of() возвращает имя правила или "" для безопасной строки.
+SECRET_RULES='
+function rule_of(s) {
+  if (s ~ /gh[pousr]_[A-Za-z0-9]{20,}/)                          return "github-token"
+  if (s ~ /sk-(ant-)?[A-Za-z0-9_-]{20,}/)                        return "anthropic/openai-key"
+  if (s ~ /(EAA|IGQ)[A-Za-z0-9_-]{20,}/)                         return "meta/instagram-token"
+  if (s ~ /AIza[0-9A-Za-z_-]{30,}/)                              return "google-api-key"
+  if (s ~ /xox[abprs]-[A-Za-z0-9-]{10,}/)                        return "slack-token"
+  if (s ~ /[0-9]{8,10}:[A-Za-z0-9_-]{35}/)                       return "telegram-bot-token"
+  if (s ~ /-----BEGIN[A-Z ]*PRIVATE KEY-----/)                   return "private-key"
+  if (s ~ /(apify_api|hf_)[A-Za-z0-9_]{20,}/)                    return "apify/hf-token"
+  if (tolower(s) ~ /(password|passwd|пароль)[[:space:]]*[:=][[:space:]]*[^[:space:]]{6,}/) return "password"
+  if (tolower(s) ~ /(api[_-]?key|secret|token)[[:space:]]*[:=][[:space:]]*.?[A-Za-z0-9_-]{20,}/) return "generic-secret"
+  return ""
+}
+'
+
+# Проверка того, что уже добавлено в индекс (перед коммитом состояния).
 scan_secrets() {
   local diff findings
   diff="$(git diff --cached -U0 --no-color -- "${STATE_PATHS[@]}" 2>/dev/null)"
   [ -z "$diff" ] && return 0
 
-  findings="$(printf '%s\n' "$diff" | awk '
+  findings="$(printf '%s\n' "$diff" | awk "$SECRET_RULES"'
     /^\+\+\+ b\// { file = substr($0, 7); next }
-    /^@@/ {
-      # @@ -a,b +c,d @@  →  берём c
-      split($3, h, ","); line = h[1]; sub(/^\+/, "", line); line = line + 0; next
-    }
+    /^@@/ { split($3, h, ","); line = h[1]; sub(/^\+/, "", line); line = line + 0; next }
     /^\+/ {
-      s = substr($0, 2)
-      rule = ""
-      if (s ~ /gh[pousr]_[A-Za-z0-9]{20,}/)                          rule = "github-token"
-      else if (s ~ /sk-(ant-)?[A-Za-z0-9_-]{20,}/)                   rule = "anthropic/openai-key"
-      else if (s ~ /(EAA|IGQ)[A-Za-z0-9_-]{20,}/)                    rule = "meta/instagram-token"
-      else if (s ~ /AIza[0-9A-Za-z_-]{30,}/)                         rule = "google-api-key"
-      else if (s ~ /xox[abprs]-[A-Za-z0-9-]{10,}/)                   rule = "slack-token"
-      else if (s ~ /[0-9]{8,10}:[A-Za-z0-9_-]{35}/)                  rule = "telegram-bot-token"
-      else if (s ~ /-----BEGIN[A-Z ]*PRIVATE KEY-----/)              rule = "private-key"
-      else if (s ~ /(apify_api|hf_)[A-Za-z0-9_]{20,}/)               rule = "apify/hf-token"
-      else if (tolower(s) ~ /(password|passwd|пароль)[[:space:]]*[:=][[:space:]]*[^[:space:]]{6,}/) rule = "password"
-      else if (tolower(s) ~ /(api[_-]?key|secret|token)[[:space:]]*[:=][[:space:]]*.?[A-Za-z0-9_-]{20,}/) rule = "generic-secret"
-      if (rule != "") printf "  %s:%d — правило %s\n", file, line, rule
+      r = rule_of(substr($0, 2))
+      if (r != "") printf "  %s:%d — правило %s\n", file, line, r
       line++
       next
     }
@@ -103,25 +109,42 @@ scan_secrets() {
   return 0
 }
 
-# fetch с повторами по сети, но БЕЗ повторов, если ветки на origin просто нет
-# (иначе старт сессии зря ждёт полминуты).
-do_fetch() {
-  local out rc delay=2 i
-  for i in 1 2 3 4 5; do
-    out="$(git fetch --quiet origin "$BRANCH" 2>&1)"; rc=$?
-    [ "$rc" -eq 0 ] && return 0
-    if printf '%s' "$out" | grep -qi "couldn't find remote ref\|not found in upstream"; then
-      echo "continuity: ветки origin/$BRANCH ещё нет — подтягивать нечего"
-      return 1
+# Предполётная проверка: смотрит файлы состояния как они лежат на диске.
+# Ничего не коммитит и не отправляет. Запускать ПЕРЕД первым синком:
+#   bash tools/continuity/sync.sh scan
+do_scan() {
+  local files=() p findings
+  for p in "${STATE_PATHS[@]}"; do
+    [ -e "$p" ] || continue
+    if [ -d "$p" ]; then
+      while IFS= read -r f; do files+=("$f"); done < <(find "$p" -type f 2>/dev/null)
+    else
+      files+=("$p")
     fi
-    printf '%s\n' "$out"
-    [ "$i" = 5 ] && break
-    echo "continuity: fetch origin/$BRANCH — попытка $i не удалась, жду ${delay}s"
-    sleep "$delay"
-    delay=$((delay * 2))
   done
-  echo "continuity: fetch origin/$BRANCH — не получилось после 5 попыток"
-  return 1
+
+  if [ "${#files[@]}" -eq 0 ]; then
+    echo "scan: файлов состояния нет — проверять нечего"
+    return 0
+  fi
+
+  echo "scan: проверяю ${#files[@]} файл(ов) состояния на секреты…"
+  findings="$(awk "$SECRET_RULES"'
+    { r = rule_of($0); if (r != "") printf "  %s:%d — правило %s\n", FILENAME, FNR, r }
+  ' "${files[@]}" 2>/dev/null)"
+
+  if [ -n "$findings" ]; then
+    echo "scan: НАЙДЕНО похожее на секреты (значения не печатаю):"
+    printf '%s\n' "$findings"
+    echo
+    echo "  Что делать: перенеси эти значения в .memory/secrets.local.md (он вне git),"
+    echo "  а в самих файлах оставь ссылку вида «токен — в secrets.local.md»."
+    echo "  Потом запусти scan ещё раз: должно стать чисто."
+    return 1
+  fi
+
+  echo "scan: чисто, можно синкать"
+  return 0
 }
 
 do_pull() {
@@ -222,9 +245,10 @@ do_push() {
 }
 
 case "$MODE" in
+  scan) do_scan ;;
   pull) do_pull; show_state ;;
   push) do_push ;;
   full) do_pull; do_push ;;
-  *) echo "continuity: неизвестный режим '$MODE' (pull|push|full)" ;;
+  *) echo "continuity: неизвестный режим '$MODE' (scan|pull|push|full)" ;;
 esac
 exit 0
